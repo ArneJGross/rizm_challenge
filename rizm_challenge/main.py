@@ -3,6 +3,7 @@
 import pathlib
 
 from rizm_challenge.util import io
+from rizm_challenge.util import optimize
 
 
 def execute_optimization():
@@ -10,7 +11,8 @@ def execute_optimization():
 
     df, pars = io.get_input(data_path)
 
-    print(df)
+    optimize.solve_problem(df, pars)
+
 
     
 
