@@ -1,5 +1,5 @@
 import dataclasses
-
+import datetime
 import pandas as pd
 import numpy as np
 import casadi as cas
@@ -7,7 +7,8 @@ import casadi as cas
 from matplotlib import dates as mdates
 from matplotlib import pyplot as plt
 
-SOLVER_NAME = "ipopt"
+
+SOLVER_NAME = "qpoases"
 
 
 @dataclasses.dataclass
@@ -34,39 +35,66 @@ def solve_problem(time_series: pd.DataFrame, system_parameters: dict[str, pd.Ser
 
     Return solution time series to analyse / plot somewhere else
     """
-    horizon = 24 * 180
 
-    ocp, opt_vars, opt_pars = _formulate_ocp(system_parameters, horizon=horizon)
-    dispatch_schedules = _solve(ocp, opt_vars, opt_pars, time_series.iloc[:horizon])
+    horizon = 24
+    window = (horizon - 1) * datetime.timedelta(hours=1)
 
-    objective = _objective_expression(dispatch_schedules, system_parameters["eff"])
+    col_names_opt_vars = list(OptVariables.__dataclass_fields__.keys())
+    schedules_ts = pd.DataFrame(
+        index=time_series.index, columns=col_names_opt_vars + ["success"]
+    )
+    objective = 0
+
+    ocp, opt_vars, opt_pars = _formulate_ocp(system_parameters, horizon)
+
+    for start in time_series.index[::horizon]:
+        current_ts = time_series.loc[start : start + window, :]
+        _schedules, success = _solve(ocp, opt_vars, opt_pars, current_ts)
+
+        objective += _objective_expression(_schedules, system_parameters["eff"])
+
+        for col_name in col_names_opt_vars:
+            schedules_ts.loc[start : start + window, col_name] = getattr(
+                _schedules, col_name
+            )
+
+        schedules_ts.loc[start : start + window, "success"] = success
+
+        if not success:
+            _plot_and_show(
+                schedules_ts.loc[start : start + window],
+                time_series.loc[start : start + window],
+                system_parameters["eff"],
+            )
+
+    print(f"Costs of operation of the system: {objective} Euro")
 
 
-
-    _plot_and_show(dispatch_schedules, time_series[:horizon])
-
-    print(objective)
-    print(dispatch_schedules)
-
-
-
-
-
-def _objective_expression(x: OptVariables, effs: pd.Series, price_gas: float | np.ndarray = 35, dt_h: float=1):
+def _objective_expression(
+    x: OptVariables,
+    effs: pd.Series,
+    price_gas: float | np.ndarray = 35,
+    dt_h: float = 1,
+):
 
     if isinstance(price_gas, np.ndarray):
-        assert len(x.p_el_gt) == len(price_gas), "If time variant gas price is given, it must have the same length as the variables."
+        assert len(x.p_el_gt) == len(
+            price_gas
+        ), "If time variant gas price is given, it must have the same length as the variables."
 
-    return cas.sum1(x.p_el_gt * dt_h * price_gas) + cas.sum1(x.p_th_boiler_gas * dt_h / effs["gasboiler"] * price_gas)
+    return cas.sum1(x.p_el_gt / effs["gasturbine"] * dt_h * price_gas) + cas.sum1(
+        x.p_th_boiler_gas / effs["gasboiler"] * dt_h * price_gas
+    )
 
 
-def _formulate_ocp(system_parameters: dict[str, pd.Series], horizon: int = 24):
+def _formulate_ocp(system_parameters: dict[str, pd.Series], horizon: int):
     """Return formulated ocp."""
 
     caps = system_parameters["cap"]
     effs = system_parameters["eff"]
 
-    ocp = cas.Opti()
+    ocp = cas.Opti("conic")
+    ocp.solver(SOLVER_NAME)
 
     # Define external data
     ext_data = OptData(
@@ -96,66 +124,96 @@ def _formulate_ocp(system_parameters: dict[str, pd.Series], horizon: int = 24):
     ocp.subject_to(x.p_el_pv >= 0)
     ocp.subject_to(x.p_el_pv <= ext_data.pv_avail * caps["photovoltaic"])
 
-
     # Define both energy conservation constraints
     # ... electrical
     ocp.subject_to(x.p_el_gt + x.p_el_pv == ext_data.load_el + x.p_el_boiler_el)
     # ... and thermal
-    ocp.subject_to(x.p_el_boiler_el * effs["electricboiler"] + x.p_th_boiler_gas == ext_data.load_th)
+    ocp.subject_to(
+        x.p_el_boiler_el * effs["electricboiler"] + x.p_th_boiler_gas
+        == ext_data.load_th
+    )
 
     ocp.minimize(_objective_expression(x, effs))
 
     return ocp, x, ext_data
 
 
-def _solve(ocp: cas.Opti, opt_vars: OptVariables, opt_pars: OptData, ts_in) -> OptVariables:
+def _solve(
+    ocp: cas.Opti, opt_vars: OptVariables, opt_pars: OptData, ts_in
+) -> tuple[OptVariables, bool]:
 
     ocp.set_value(opt_pars.load_el, ts_in["load_el"])
     ocp.set_value(opt_pars.load_th, ts_in["load_th"])
     ocp.set_value(opt_pars.pv_avail, ts_in["pv_avail"])
 
-    ocp.solver("ipopt")
-    solution = ocp.solve()
+    try:
+        solution = ocp.solve()
+        result = OptVariables(
+            p_el_gt=solution.value(opt_vars.p_el_gt),
+            p_el_boiler_el=solution.value(opt_vars.p_el_boiler_el),
+            p_th_boiler_gas=solution.value(opt_vars.p_th_boiler_gas),
+            p_el_pv=solution.value(opt_vars.p_el_pv),
+        )
 
-    result = OptVariables(
-        p_el_gt=solution.value(opt_vars.p_el_gt),
-        p_el_boiler_el=solution.value(opt_vars.p_el_boiler_el),
-        p_th_boiler_gas=solution.value(opt_vars.p_th_boiler_gas),
-        p_el_pv=solution.value(opt_vars.p_el_pv)
-    )
+        return result, True
+    except RuntimeError:
+        # Infeasible problem
+        result = OptVariables(
+            p_el_gt=ocp.debug.value(opt_vars.p_el_gt),
+            p_el_boiler_el=ocp.debug.value(opt_vars.p_el_boiler_el),
+            p_th_boiler_gas=ocp.debug.value(opt_vars.p_th_boiler_gas),
+            p_el_pv=ocp.debug.value(opt_vars.p_el_pv),
+        )
+        return result, False
 
-    return result
 
-def _plot_and_show(x: OptVariables, ext_data: pd.DataFrame):
+def _plot_and_show(x: OptVariables, ext_data: pd.DataFrame, effs: pd.Series):
     index = ext_data.index
 
-    fig, ax = _styled_plot(date_axis=True, ylabel="Electric Power / MW", figsize="landscape")
+    fig, ax_elec = _styled_plot(
+        date_axis=True, ylabel="Electric Power / MW", figsize="landscape"
+    )
 
-    ax.plot(index, x.p_el_gt, label="P_el gas turbine")
-    ax.plot(index, x.p_el_pv, label="P_pv generator")
-    ax.plot(index, -ext_data["load_el"], label="Ext Load")
-    ax.plot(index, -x.p_el_boiler_el, label="P_el boiler elec.")
+    ax_elec.plot(index, x.p_el_gt, label="P_el gas turbine")
+    ax_elec.plot(index, x.p_el_pv, label="P_pv generator")
+    ax_elec.plot(index, -ext_data["load_el"], label="Ext Load")
+    ax_elec.plot(index, -x.p_el_boiler_el, label="P_el boiler elec.")
 
-    ax.legend()
+    # Check if those two overlap
+    ax_elec.plot(index, x.p_el_gt + x.p_el_pv, label="Generation")
+    ax_elec.plot(index, x.p_el_boiler_el + ext_data["load_el"], label="Consumption")
+
+    ax_elec.legend()
+
+    fig, ax_thermal = _styled_plot(
+        date_axis=True, ylabel="Thermal Power / MW", figsize="landscape"
+    )
+
+    ax_thermal.plot(
+        index, x["p_el_boiler_el"] * effs["electricboiler"], label="El. Boiler"
+    )
+    ax_thermal.plot(index, x["p_th_boiler_gas"], label="Gas Boiler")
+    ax_thermal.plot(index, -ext_data["load_th"], label="Thermal Load")
+    ax_thermal.legend()
 
     plt.show()
-
-
 
 
 def _styled_plot(**kwargs):
     """Copied this from my university project."""
     plot_defaults = dict(
-    major_formatter="%H:%M",
-    figsize=(10, 10),
-    date_axis=False,
-    title="",
-    xlabel="",
-    ylabel="",
-    ylim=None,
-    xlim=None,
-)
-    figsize_defaults = dict(landscape=(8, 4), policies=(8, 5), portrait=(4, 4), slim=(3, 4))
+        major_formatter="%H:%M",
+        figsize=(10, 10),
+        date_axis=False,
+        title="",
+        xlabel="",
+        ylabel="",
+        ylim=None,
+        xlim=None,
+    )
+    figsize_defaults = dict(
+        landscape=(8, 4), policies=(8, 5), portrait=(4, 4), slim=(3, 4)
+    )
 
     specs = {}
     specs.update(plot_defaults)
@@ -170,9 +228,7 @@ def _styled_plot(**kwargs):
         fig, ax = plt.subplots()
 
     if specs["date_axis"]:
-        ax.xaxis.set_major_formatter(
-            mdates.DateFormatter(specs["major_formatter"])
-        )
+        ax.xaxis.set_major_formatter(mdates.DateFormatter(specs["major_formatter"]))
         ax.set_xlabel("Time")
     else:
         ax.set_xlabel(specs["xlabel"])
