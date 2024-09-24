@@ -1,3 +1,4 @@
+"""Mainly code to read the input data."""
 import warnings
 import pathlib
 
@@ -23,7 +24,21 @@ def _repair_data(ts: pd.DataFrame):
     return ts[~ts.isna().any(axis=1)]
 
 
-def get_input(data_path: pathlib.Path):
+def _read_parameters(parameter_file_name: pathlib.Path):
+
+    parameters = pd.read_csv(parameter_file_name).set_index("component")
+
+    effs = parameters.loc[parameters["parameter_type"] == "efficiency", "value"]
+    caps = parameters.loc[parameters["parameter_type"] == "capacity", "value"]
+
+    caps.loc["photovoltaic"] /= 1000.0  # transform kW -> MW (in a hacky way for now)
+    effs /= 100.0  # transform to fraction (in a hacky way)
+
+    return {"cap": caps, "eff": effs}
+
+
+def get_input(data_path: pathlib.Path) -> tuple[pd.DataFrame, dict[str, pd.Series]]:
+    """Read input data and return parameters and time series data."""
 
     ts = pd.concat(
         [
@@ -36,14 +51,6 @@ def get_input(data_path: pathlib.Path):
     )
 
     ts = _repair_data(ts)
+    parameters = _read_parameters(data_path / "parameter.csv")
 
-    pars = pd.read_csv(data_path / "parameter.csv").set_index("component")
-    
-    effs = parameters.loc[parameters["parameter_type"] == "efficiency", "value"]
-    caps = parameters.loc[parameters["parameter_type"] == "capacity", "value"]
-
-    caps.loc["photovoltaic"] /= 1000.0  # transform kW -> MW (in a hacky way for now)
-    effs /= 100.0  # transform to fraction (in a hacky way)
-
-
-    return ts, pars
+    return ts, parameters
