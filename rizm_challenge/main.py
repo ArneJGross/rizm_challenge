@@ -11,9 +11,7 @@ def execute_optimization():
 
     df, pars = io.get_input(data_path)
 
-    optimize.solve_problem(df, pars)
-
-
+    optimize.solve_problem(df, pars, plot_on_fail=False)
     
 
 if __name__ == "__main__":

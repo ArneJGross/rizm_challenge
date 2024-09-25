@@ -19,6 +19,7 @@ class OptVariables:
     p_el_boiler_el: cas.MX  # electric power of electric boiler
     p_th_boiler_gas: cas.MX  # thermal (output) power of gas boiler
     p_el_pv: cas.MX  # electric (output) power of PV generator
+    slack_th: cas.MX  # slack variable to assert feasibility
 
 
 @dataclasses.dataclass
@@ -30,7 +31,11 @@ class OptData:
     pv_avail: cas.MX  # availability of PV
 
 
-def solve_problem(time_series: pd.DataFrame, system_parameters: dict[str, pd.Series]):
+def solve_problem(
+    time_series: pd.DataFrame,
+    system_parameters: dict[str, pd.Series],
+    plot_on_fail=True,
+):
     """Setup problem and solve.
 
     Return solution time series to analyse / plot somewhere else
@@ -51,7 +56,9 @@ def solve_problem(time_series: pd.DataFrame, system_parameters: dict[str, pd.Ser
         current_ts = time_series.loc[start : start + window, :]
         _schedules, success = _solve(ocp, opt_vars, opt_pars, current_ts)
 
-        objective += _objective_expression(_schedules, system_parameters["eff"])
+        objective += _objective_expression(
+            _schedules, system_parameters["eff"], slack_penalty=0.0
+        )
 
         for col_name in col_names_opt_vars:
             schedules_ts.loc[start : start + window, col_name] = getattr(
@@ -60,12 +67,18 @@ def solve_problem(time_series: pd.DataFrame, system_parameters: dict[str, pd.Ser
 
         schedules_ts.loc[start : start + window, "success"] = success
 
-        if not success:
+        if not success and plot_on_fail:
             _plot_and_show(
                 schedules_ts.loc[start : start + window],
                 time_series.loc[start : start + window],
                 system_parameters["eff"],
             )
+
+    ind_slack = schedules_ts.index[schedules_ts["slack_th"] > 0.0]
+    print(
+        f"Heat load could not be satisfied in these time instances: {list(ind_slack)}."
+        f" Overall {schedules_ts['slack_th'][ind_slack].sum():0.04f} MWh where not supplied."
+    )
 
     print(f"Costs of operation of the system: {objective} Euro")
 
@@ -75,6 +88,7 @@ def _objective_expression(
     effs: pd.Series,
     price_gas: float | np.ndarray = 35,
     dt_h: float = 1,
+    slack_penalty: float = 1000.0,
 ):
 
     if isinstance(price_gas, np.ndarray):
@@ -84,6 +98,7 @@ def _objective_expression(
 
     return cas.sum1(x.p_el_gt / effs["gasturbine"] * dt_h * price_gas) + cas.sum1(
         x.p_th_boiler_gas / effs["gasboiler"] * dt_h * price_gas
+        + cas.sum1(x.slack_th * slack_penalty)
     )
 
 
@@ -109,6 +124,7 @@ def _formulate_ocp(system_parameters: dict[str, pd.Series], horizon: int):
         p_el_boiler_el=ocp.variable(horizon),
         p_th_boiler_gas=ocp.variable(horizon),
         p_el_pv=ocp.variable(horizon),
+        slack_th=ocp.variable(horizon),
     )
 
     # Define bounds for optimization variables
@@ -124,13 +140,16 @@ def _formulate_ocp(system_parameters: dict[str, pd.Series], horizon: int):
     ocp.subject_to(x.p_el_pv >= 0)
     ocp.subject_to(x.p_el_pv <= ext_data.pv_avail * caps["photovoltaic"])
 
+    ocp.subject_to(x.slack_th >= 0)
+    ocp.subject_to(x.slack_th <= ext_data.load_th)
+
     # Define both energy conservation constraints
     # ... electrical
     ocp.subject_to(x.p_el_gt + x.p_el_pv == ext_data.load_el + x.p_el_boiler_el)
     # ... and thermal
     ocp.subject_to(
         x.p_el_boiler_el * effs["electricboiler"] + x.p_th_boiler_gas
-        == ext_data.load_th
+        == ext_data.load_th - x.slack_th
     )
 
     ocp.minimize(_objective_expression(x, effs))
@@ -153,16 +172,20 @@ def _solve(
             p_el_boiler_el=solution.value(opt_vars.p_el_boiler_el),
             p_th_boiler_gas=solution.value(opt_vars.p_th_boiler_gas),
             p_el_pv=solution.value(opt_vars.p_el_pv),
+            slack_th=solution.value(opt_vars.slack_th),
         )
 
-        return result, True
+        return result, (result.slack_th == 0).all()
     except RuntimeError:
         # Infeasible problem
+        ts_in.plot()
+        plt.show()
         result = OptVariables(
             p_el_gt=ocp.debug.value(opt_vars.p_el_gt),
             p_el_boiler_el=ocp.debug.value(opt_vars.p_el_boiler_el),
             p_th_boiler_gas=ocp.debug.value(opt_vars.p_th_boiler_gas),
             p_el_pv=ocp.debug.value(opt_vars.p_el_pv),
+            slack_th=ocp.debug.value(opt_vars.slack_th),
         )
         return result, False
 
@@ -190,10 +213,20 @@ def _plot_and_show(x: OptVariables, ext_data: pd.DataFrame, effs: pd.Series):
     )
 
     ax_thermal.plot(
-        index, x["p_el_boiler_el"] * effs["electricboiler"], label="El. Boiler"
+        index,
+        x["p_el_boiler_el"] * effs["electricboiler"],
+        label="El. Boiler",
+        drawstyle="steps-post",
     )
-    ax_thermal.plot(index, x["p_th_boiler_gas"], label="Gas Boiler")
-    ax_thermal.plot(index, -ext_data["load_th"], label="Thermal Load")
+    ax_thermal.plot(
+        index, x["p_th_boiler_gas"], label="Gas Boiler", drawstyle="steps-post"
+    )
+    ax_thermal.plot(
+        index, -ext_data["load_th"], label="Thermal Load", drawstyle="steps-post"
+    )
+    ax_thermal.plot(
+        index, x["slack_th"], label="unsatisfiable heat load", drawstyle="steps-post"
+    )
     ax_thermal.legend()
 
     plt.show()
