@@ -29,6 +29,7 @@ class OptData:
     load_el: cas.MX  # electric load to e satisfied
     load_th: cas.MX  # thermal load to be satisfied
     pv_avail: cas.MX  # availability of PV
+    gas_price: cas.MX  # price time series of gas
 
 
 def solve_problem(
@@ -41,6 +42,8 @@ def solve_problem(
     Return solution time series to analyse / plot somewhere else
     """
 
+    time_series["gas_price"] = 35.
+
     horizon = 24
     window = (horizon - 1) * datetime.timedelta(hours=1)
 
@@ -50,16 +53,20 @@ def solve_problem(
     )
     objective = 0
 
+    # Set up OCP once at the beginning and reuse
     ocp, opt_vars, opt_pars = _formulate_ocp(system_parameters, horizon)
 
+    # No state and connection between time steps -> can be solved in parts and glued together
     for start in time_series.index[::horizon]:
         current_ts = time_series.loc[start : start + window, :]
+        # Solve current subproblem
         _schedules, success = _solve(ocp, opt_vars, opt_pars, current_ts)
 
         objective += _objective_expression(
             _schedules, system_parameters["eff"], slack_penalty=0.0
         )
 
+        # store schedules (optimal solution) in time series
         for col_name in col_names_opt_vars:
             schedules_ts.loc[start : start + window, col_name] = getattr(
                 _schedules, col_name
@@ -70,23 +77,27 @@ def solve_problem(
         if not success and plot_on_fail:
             _plot_and_show(
                 schedules_ts.loc[start : start + window],
-                time_series.loc[start : start + window],
+                current_ts,
                 system_parameters["eff"],
             )
 
+    # Make some basic results analysis
+    _plot_and_show(schedules_ts, time_series, system_parameters["eff"])
     ind_slack = schedules_ts.index[schedules_ts["slack_th"] > 0.0]
     print(
         f"Heat load could not be satisfied in these time instances: {list(ind_slack)}."
         f" Overall {schedules_ts['slack_th'][ind_slack].sum():0.04f} MWh where not supplied."
     )
 
-    print(f"Costs of operation of the system: {objective} Euro")
+    print(f"Costs of operation of the system: {objective / 1e6: 0.04f} Mio Euro")
+
+    return schedules_ts
 
 
 def _objective_expression(
     x: OptVariables,
     effs: pd.Series,
-    price_gas: float | np.ndarray = 35,
+    price_gas: float | np.ndarray | cas.MX = 35,
     dt_h: float = 1,
     slack_penalty: float = 1000.0,
 ):
@@ -116,6 +127,7 @@ def _formulate_ocp(system_parameters: dict[str, pd.Series], horizon: int):
         load_el=ocp.parameter(horizon),
         load_th=ocp.parameter(horizon),
         pv_avail=ocp.parameter(horizon),
+        gas_price=ocp.parameter(horizon),
     )
 
     # Define optimization variables
@@ -152,7 +164,7 @@ def _formulate_ocp(system_parameters: dict[str, pd.Series], horizon: int):
         == ext_data.load_th - x.slack_th
     )
 
-    ocp.minimize(_objective_expression(x, effs))
+    ocp.minimize(_objective_expression(x, effs, price_gas=ext_data.gas_price))
 
     return ocp, x, ext_data
 
@@ -164,6 +176,7 @@ def _solve(
     ocp.set_value(opt_pars.load_el, ts_in["load_el"])
     ocp.set_value(opt_pars.load_th, ts_in["load_th"])
     ocp.set_value(opt_pars.pv_avail, ts_in["pv_avail"])
+    ocp.set_value(opt_pars.gas_price, ts_in["gas_price"])
 
     try:
         solution = ocp.solve()
@@ -190,26 +203,27 @@ def _solve(
         return result, False
 
 
-def _plot_and_show(x: OptVariables, ext_data: pd.DataFrame, effs: pd.Series):
+def _plot_and_show(x: pd.DataFrame, ext_data: pd.DataFrame, effs: pd.Series):
+    """Make some plots to sanity check (intermediate) results."""
     index = ext_data.index
 
     fig, ax_elec = _styled_plot(
-        date_axis=True, ylabel="Electric Power / MW", figsize="landscape"
+        ylabel="Electric Power / MW", xlabel="Time", figsize="landscape"
     )
 
-    ax_elec.plot(index, x.p_el_gt, label="P_el gas turbine")
-    ax_elec.plot(index, x.p_el_pv, label="P_pv generator")
+    ax_elec.plot(index, x["p_el_gt"], label="P_el gas turbine")
+    ax_elec.plot(index, x["p_el_pv"], label="P_pv generator")
     ax_elec.plot(index, -ext_data["load_el"], label="Ext Load")
-    ax_elec.plot(index, -x.p_el_boiler_el, label="P_el boiler elec.")
+    ax_elec.plot(index, -x["p_el_boiler_el"], label="P_el boiler elec.")
 
     # Check if those two overlap
-    ax_elec.plot(index, x.p_el_gt + x.p_el_pv, label="Generation")
-    ax_elec.plot(index, x.p_el_boiler_el + ext_data["load_el"], label="Consumption")
+    ax_elec.plot(index, x["p_el_gt"] + x.p_el_pv, label="Generation")
+    ax_elec.plot(index, x["p_el_boiler_el"] + ext_data["load_el"], label="Consumption")
 
     ax_elec.legend()
 
     fig, ax_thermal = _styled_plot(
-        date_axis=True, ylabel="Thermal Power / MW", figsize="landscape"
+        ylabel="Thermal Power / MW", xlabel="Time", figsize="landscape"
     )
 
     ax_thermal.plot(

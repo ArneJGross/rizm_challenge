@@ -16,6 +16,10 @@ def _read_ts(file_name: pathlib.Path, col_name:str):
 
 
 def _repair_data(ts: pd.DataFrame):
+    """The given input data was shifted between different sources.
+    This is specific to the given data here. Needs to be extended depending on the data.
+    E.g. to handle nans in the middle better if a state exists.
+    """
     nan_indices = ts.index[ts.isna().any(axis=1)]
 
     if len(nan_indices) > 0:
