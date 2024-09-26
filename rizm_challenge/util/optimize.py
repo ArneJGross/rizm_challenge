@@ -89,7 +89,7 @@ def solve_problem(
         f" Overall {schedules_ts['slack_th'][ind_slack].sum():0.04f} MWh where not supplied."
     )
 
-    print(f"Costs of operation of the system: {objective / 1e6: 0.04f} Mio Euro")
+    print(f"Costs of operation of the system: {objective / 1e6} Mio Euro")
 
     return schedules_ts
 
